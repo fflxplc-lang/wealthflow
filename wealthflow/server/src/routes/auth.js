@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { db, audit } from '../db.js';
-import { sign, requireAuth } from '../auth.js';
+import { sign, requireAuth, teamOf } from '../auth.js';
 
 const r = Router();
 
@@ -16,11 +16,12 @@ r.post('/login', (req, res) => {
   }
   if (!user.active) return res.status(403).json({ error: 'This account is disabled' });
   audit(user, 'LOGIN', `${user.name} signed in`);
-  res.json({ token: sign(user), user: publicUser(user) });
+  res.json({ token: sign(user), user: { ...publicUser(user), team: teamOf(user) } });
 });
 
 r.get('/me', requireAuth, (req, res) => {
-  res.json(publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id)));
+  const me = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  res.json({ ...publicUser(me), team: teamOf(me) });
 });
 
 r.post('/logout', requireAuth, (req, res) => {

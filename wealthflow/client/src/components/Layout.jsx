@@ -5,7 +5,7 @@ import {
   Search, Cloud, Moon, Sun, LogOut, Bell, CheckCheck, Clock,
 } from 'lucide-react';
 import Logo from './Logo.jsx';
-import { api, setToken } from '../api.js';
+import { api, setToken, getViewAs, setViewAs } from '../api.js';
 import { useAuth } from '../auth.jsx';
 import { timeAgo } from '../ui.jsx';
 
@@ -99,7 +99,7 @@ export default function Layout({ children }) {
   };
   const signOut = async () => {
     try { await api.post('/auth/logout'); } catch { /* ignore */ }
-    setToken(null); setUser(null);
+    setToken(null); setViewAs(null); setUser(null);
   };
   const admin = user.role === 'admin';
   return (
@@ -126,6 +126,13 @@ export default function Layout({ children }) {
         <header className="topbar">
           <GlobalSearch />
           <div className="row gap">
+            {user.role === 'mentor' && user.team?.length > 0 && (
+              <select className="select sm" style={{ width: 'auto', maxWidth: 240 }} title="Whose data to show" value={getViewAs()}
+                onChange={(e) => { setViewAs(e.target.value); window.location.reload(); }}>
+                <option value="">Viewing: me</option>
+                {user.team.map((t) => <option key={t.id} value={t.id}>Viewing: {t.name} · L{t.level}</option>)}
+              </select>
+            )}
             <span className="live"><Cloud size={11} />LIVE</span>
             <button className="icon-btn" onClick={toggleTheme} title="Toggle theme">{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button>
             <button className="icon-btn" onClick={signOut} title="Sign out"><LogOut size={18} /></button>

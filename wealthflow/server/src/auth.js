@@ -25,5 +25,21 @@ export function requireAdmin(req, res, next) {
   next();
 }
 
-// Admins see everything; everyone else is scoped to their own earnings.
-export const scopeUser = (req) => (req.user.role === 'admin' ? null : req.user.id);
+// People a mentor can look at: themselves and everyone who reports to them directly.
+export function teamOf(user) {
+  if (user?.role !== 'mentor') return [];
+  return db.prepare('SELECT id, name, code, level FROM users WHERE parent_id = ? AND active = 1 ORDER BY level DESC, name').all(user.id);
+}
+
+// The person whose data a read request shows. Admins see everything (null). A mentor can switch to a
+// direct report with the X-View-As header (or ?viewAs= on opened pages); everyone else sees only
+// themselves. Anything that changes data always acts as the signed-in person.
+export function viewAs(req) {
+  if (req.user.role === 'admin') return null;
+  const want = Number(req.headers?.['x-view-as'] || req.query?.viewAs) || null;
+  if (req.method === 'GET' && want && want !== req.user.id && teamOf(req.user).some((u) => u.id === want)) return want;
+  return req.user.id;
+}
+
+// Admins see everything; everyone else is scoped to their own earnings (a mentor to the person picked).
+export const scopeUser = (req) => viewAs(req);

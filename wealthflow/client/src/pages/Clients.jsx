@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Shield, Users, Database, Search, UserPlus, Copy, Pencil, Trash2, Download, Plus, Check, Tags, UserCog, Mail, Phone, IdCard } from 'lucide-react';
+import { Shield, Users, Database, Search, UserPlus, Copy, Pencil, Trash2, Download, Upload, FileSpreadsheet, Plus, Check, Tags, UserCog, Mail, Phone, IdCard } from 'lucide-react';
 import { api, qs } from '../api.js';
 import { useAuth } from '../auth.jsx';
 import { Card, PageHead, Segmented, useLoad, useAction, Spinner, Empty, Modal, Field, Pager, Confirm, exportExcel, inrShort, LEVELS, useToast } from '../ui.jsx';
@@ -8,13 +8,35 @@ import { Card, PageHead, Segmented, useLoad, useAction, Spinner, Empty, Modal, F
 // ---------------- Hierarchy (team accounts) ----------------
 const blankUser = { name: '', email: '', code: '', gst: '', parent_id: '', sharing_pct: 0, role: 'ops', level: 1, password: '', extra_levels: [], bank: {}, address: { country: 'India' } };
 
+// The policy's share for a level: L1-L3 their own-lead rate, L4 the whole pool, L5-L7 the top share.
+export function levelDefaultPct(level, sharing) {
+  if (!sharing) return 0;
+  const top = Object.values(sharing.top || {}).reduce((s, v) => s + Number(v || 0), 0);
+  if (level <= 3) return Number(sharing.rates?.[level] ?? 0);
+  if (level === 4) return Math.max(0, 100 - top);
+  return Number(sharing.top?.[level] ?? 0);
+}
+
 export function UserModal({ initial, users, onClose, onSaved }) {
   const [f, setF] = useState(() => ({ ...blankUser, ...initial, password: '', bank: { ...(initial?.bank || {}) }, address: { country: 'India', ...(initial?.address || {}) } }));
   const [run, busy] = useAction();
   const set = (k, v) => setF((x) => ({ ...x, [k]: v }));
+  const rules = useLoad(() => api.get('/settings/global'), []);
+  const sharing = rules.data?.sharing;
+  const def = levelDefaultPct(f.level, sharing);
+  // Fill the rule's % when the form opens without a personal rate, and again whenever the level changes.
+  const filled = useRef(false);
+  useEffect(() => {
+    if (!sharing || filled.current) return;
+    filled.current = true;
+    if (!(Number(initial?.sharing_pct) > 0)) set('sharing_pct', levelDefaultPct(f.level, sharing));
+  }, [sharing]); // eslint-disable-line react-hooks/exhaustive-deps
+  const pickLevel = (l) => setF((x) => ({ ...x, level: l, sharing_pct: levelDefaultPct(l, sharing), extra_levels: x.extra_levels.filter((e) => e !== l) }));
   const setIn = (o, k, v) => setF((x) => ({ ...x, [o]: { ...x[o], [k]: v } }));
   const save = (recalculate) => run(async () => {
-    const body = { ...f, recalculate };
+    // A % equal to the rule is stored as "follow the rule", so later policy changes still apply.
+    const pct = Number(f.sharing_pct) || 0;
+    const body = { ...f, sharing_pct: f.level >= 4 || pct === levelDefaultPct(f.level, sharing) ? 0 : pct, recalculate };
     if (initial?.id) await api.put(`/users/${initial.id}`, body); else await api.post('/users', body);
     onSaved(); onClose();
   }, recalculate ? 'Saved and payouts recalculated' : 'Saved');
@@ -41,16 +63,20 @@ export function UserModal({ initial, users, onClose, onSaved }) {
             {users.filter((u) => u.id !== initial?.id).map((u) => <option key={u.id} value={u.id}>{u.name} · L{u.level}</option>)}
           </select>
         </Field>
-        <Field label="Sharing % Rate"><input className="input" type="number" step="0.01" value={f.sharing_pct} onChange={(e) => set('sharing_pct', e.target.value)} /></Field>
+        <Field label="Sharing % Rate" hint={!sharing ? '' : f.level >= 4 ? `L${f.level} share comes from the policy (${def}%). Set a custom % in Admin Console → User Sharing.` : Number(f.sharing_pct) === def ? `Policy rate for L${f.level}. Change it only for a personal rate.` : `Personal rate. The policy rate for L${f.level} is ${def}%.`}>
+          <input className="input" type="number" step="0.01" value={f.level >= 4 ? def : f.sharing_pct} readOnly={f.level >= 4} onChange={(e) => set('sharing_pct', e.target.value)} />
+        </Field>
       </div>
       <div className="grid g3">
         <Field label="Role">
           <select className="select" value={f.role} onChange={(e) => set('role', e.target.value)}>
-            <option value="ops">Ops / RM — own data</option><option value="partner">Partner — own data</option><option value="admin">Admin — full access</option>
+            <option value="ops">Ops / RM — own data</option><option value="partner">Partner — own data</option>
+            <option value="mentor">Mentor — own data + direct reports</option><option value="admin">Admin — full access</option>
           </select>
+          {f.role === 'mentor' && <span className="tiny muted">A mentor sees their own data and that of everyone who reports to them directly.</span>}
         </Field>
         <Field label="System Level (Primary)">
-          <select className="select" value={f.level} onChange={(e) => set('level', Number(e.target.value))}>
+          <select className="select" value={f.level} onChange={(e) => pickLevel(Number(e.target.value))}>
             {[1, 2, 3, 4, 5, 6, 7].map((l) => <option key={l} value={l}>Level {l} · {LEVELS[l]}</option>)}
           </select>
         </Field>
@@ -83,12 +109,79 @@ export function UserModal({ initial, users, onClose, onSaved }) {
   );
 }
 
+// One layout for the team export, the import template and the import itself, so an export can be
+// edited and imported back.
+const ROLE_LABEL = { ops: 'Ops / RM', mentor: 'Mentor', partner: 'Partner', admin: 'Admin' };
+const teamRow = (u, byId) => ({
+  'Full Name': u.name, 'Access Email': u.email, 'Employee/ARN Code': u.code || '', Level: `L${u.level}`,
+  'Reports To': u.parent_id ? byId.get(Number(u.parent_id))?.name || '' : '', Role: ROLE_LABEL[u.role] || u.role,
+  'Sharing %': Number(u.sharing_pct) || '', 'Additional Levels': (u.extra_levels || []).map((l) => `L${l}`).join(', '),
+  GSTIN: u.gst || '', PAN: u.pan || '', 'Account Holder': u.bank?.holder || '', 'Bank Name': u.bank?.bankName || '',
+  Branch: u.bank?.branch || '', 'Account Number': u.bank?.account || '', IFSC: u.bank?.ifsc || '',
+  Street: u.address?.street || '', City: u.address?.city || '', State: u.address?.state || '', Pincode: u.address?.pincode || '',
+});
+const TEMPLATE = [
+  { 'Full Name': 'ANMOL KUMAR JHA', 'Access Email': 'anmol@example.com', 'Employee/ARN Code': 'ARN-270605', Level: 'L4', 'Reports To': '', Role: 'Mentor', Password: 'Welcome@123', 'Sharing %': '', 'Additional Levels': '', GSTIN: '', PAN: 'ABCPJ1234F', 'Account Holder': 'ANMOL KUMAR JHA', 'Bank Name': 'HDFC Bank', Branch: 'Andheri', 'Account Number': '50100012345678', IFSC: 'HDFC0000123', Street: '12 MG Road', City: 'Mumbai', State: 'Maharashtra', Pincode: '400001' },
+  { 'Full Name': 'Johnson M John', 'Access Email': 'johnson@example.com', 'Employee/ARN Code': 'WF-101', Level: 'L1', 'Reports To': 'anmol@example.com', Role: 'Ops / RM', Password: '', 'Sharing %': '', 'Additional Levels': '', GSTIN: '27ABCPJ1234F1Z6', PAN: '', 'Account Holder': '', 'Bank Name': '', Branch: '', 'Account Number': '', IFSC: '', Street: '', City: 'Pune', State: 'Maharashtra', Pincode: '411001' },
+];
+
+function ImportTeam({ onClose, onDone }) {
+  const [file, setFile] = useState(null);
+  const [prev, setPrev] = useState(null);
+  const [run, busy] = useAction();
+  const pick = (fl) => { setFile(fl); setPrev(null); if (!fl) return; const fd = new FormData(); fd.append('file', fl); run(async () => setPrev(await api.post('/users/import/preview', fd))); };
+  const apply = () => run(async () => {
+    const fd = new FormData(); fd.append('file', file);
+    const r = await api.post('/users/import/apply', fd);
+    onDone(); onClose();
+    return r;
+  }, 'Team accounts created');
+  return (
+    <Modal wide title="Import RMs and Mentors" onClose={onClose} footer={<>
+      <button className="btn btn-ghost btn-caps" onClick={onClose}>Cancel</button>
+      <button className="btn btn-primary btn-caps btn-lg" disabled={busy || !prev?.ok} onClick={apply}>Create {prev?.ok || 0} account{prev?.ok === 1 ? '' : 's'}</button>
+    </>}>
+      <div className="small muted">One row per person. Required: <b>Full Name</b>, <b>Access Email</b> and <b>Level</b> (L1 to L7). <b>Role</b> is Ops / RM, Mentor, Partner or Admin (blank = Ops / RM).
+        <b> Reports To</b> is the manager's email, code or name, either already in the team or in the same file. A blank <b>Password</b> gives <span className="mono">Welcome@123</span>.
+        A blank <b>Sharing %</b> follows the policy for the level. People whose email already has an account are skipped.</div>
+      <div className="row gap wrap">
+        <button className="btn btn-soft btn-caps" onClick={() => exportExcel(TEMPLATE, 'team-import-template.xlsx')}><FileSpreadsheet size={14} />Download template</button>
+        <label className="btn btn-primary btn-caps"><Upload size={14} />{file ? file.name : 'Choose filled file'}<input type="file" accept=".xlsx,.xls,.csv" hidden onChange={(e) => pick(e.target.files[0] || null)} /></label>
+      </div>
+      {busy && !prev && <Spinner />}
+      {prev && (
+        <>
+          <div className="small"><b className="t-green">{prev.ok} ready</b>{prev.errors > 0 && <> · <b className="t-red">{prev.errors} with errors (skipped)</b></>}</div>
+          <div className="table-wrap scroll" style={{ maxHeight: 360 }}>
+            <table className="t compact">
+              <thead><tr><th>Row</th><th>Name</th><th>Email</th><th>Level</th><th>Role</th><th>Reports to</th><th>Check</th></tr></thead>
+              <tbody>{prev.rows.map((x) => (
+                <tr key={x.row}>
+                  <td>{x.row}</td><td className="semi">{x.name}</td><td className="small">{x.email}</td><td>{x.level ? `L${x.level}` : '—'}</td>
+                  <td>{ROLE_LABEL[x.role] || '—'}</td><td className="small">{x.parentName || x.parentRef || '—'}</td>
+                  <td className="small">{x.errors.length ? <span className="t-red">{x.errors.join('; ')}</span> : <span className="t-green">OK</span>}
+                    {x.notes.length > 0 && <div className="tiny muted">{x.notes.join('; ')}</div>}</td>
+                </tr>))}</tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
 function Hierarchy({ initialQ }) {
   const [q, setQ] = useState(initialQ || '');
   const [edit, setEdit] = useState(null);
   const [del, setDel] = useState(null);
+  const [importing, setImporting] = useState(false);
   const [run] = useAction();
   const toast = useToast();
+  const doExport = () => {
+    const list = all.data || [];
+    const byId = new Map(list.map((u) => [u.id, u]));
+    exportExcel(list.slice().sort((a, b) => b.level - a.level || a.name.localeCompare(b.name)).map((u) => ({ ...teamRow(u, byId), 'Mapped Clients': u.clients })), 'team-rm-mentors.xlsx');
+  };
   const { data, reload } = useLoad(() => api.get(`/users${qs({ q })}`), [q]);
   const all = useLoad(() => api.get('/users'), []);
   const copy = (u) => {
@@ -100,7 +193,11 @@ function Hierarchy({ initialQ }) {
       <div className="card-head">
         <div className="row gap-lg"><span className="card-title">Active System Accounts</span>
           <div className="input-icon"><Search size={13} /><input className="input sm" style={{ width: 230, borderRadius: 999 }} placeholder="SEARCH USER NAME OR EMAIL..." value={q} onChange={(e) => setQ(e.target.value)} /></div></div>
-        <button className="btn btn-primary btn-caps" onClick={() => setEdit({})}><UserPlus size={14} />New User Account</button>
+        <div className="row gap-sm wrap">
+          <button className="btn btn-green btn-caps" onClick={doExport} disabled={!all.data}><Download size={14} />Export</button>
+          <button className="btn btn-soft btn-caps" onClick={() => setImporting(true)}><Upload size={14} />Import</button>
+          <button className="btn btn-primary btn-caps" onClick={() => setEdit({})}><UserPlus size={14} />New User Account</button>
+        </div>
       </div>
       {!data ? <Spinner /> : (
         <div className="table-wrap">
@@ -110,7 +207,7 @@ function Hierarchy({ initialQ }) {
               {data.map((u) => (
                 <tr key={u.id}>
                   <td><div className="cell-main">{u.name}</div><div className="small muted">{u.email}</div></td>
-                  <td><span className="tag">{u.role.toUpperCase()}</span> <b>L{u.level}</b> <span className="tiny faint">{u.level_name}</span>
+                  <td><span className={`tag ${u.role === 'mentor' ? 'green' : ''}`}>{u.role.toUpperCase()}</span> <b>L{u.level}</b> <span className="tiny faint">{u.level_name}</span>
                     {u.extra_levels?.length > 0 && <div className="cell-sub">+ {u.extra_levels.map((l) => `L${l}`).join(', ')}</div>}</td>
                   <td className="small muted">{u.parent_name || '—'}</td>
                   <td><div className="bold t-blue" style={{ fontSize: 16 }}>{u.clients}</div><div className="cell-sub upper">Direct clients</div></td>
@@ -123,6 +220,7 @@ function Hierarchy({ initialQ }) {
         </div>
       )}
       {edit && <UserModal initial={edit} users={all.data || []} onClose={() => setEdit(null)} onSaved={() => { reload(); all.reload(); }} />}
+      {importing && <ImportTeam onClose={() => setImporting(false)} onDone={() => { reload(); all.reload(); }} />}
       {del && <Confirm danger title="Delete user?" text={`${del.name} will be removed from every client hierarchy and their reports will move up to their manager. Payouts recalculate.`} confirmLabel="Delete"
         onClose={() => setDel(null)} onConfirm={() => run(() => api.del(`/users/${del.id}`).then(reload), 'User deleted')} />}
     </Card>

@@ -1,10 +1,12 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
+import multer from 'multer';
 import { db, audit, tx, LEVEL_NAMES } from '../db.js';
-import { requireAdmin } from '../auth.js';
+import { requireAdmin, teamOf } from '../auth.js';
 import { publicUser } from './auth.js';
 import { recalculate, rebuildHierarchies } from '../services/payout.js';
-import { parseJSON } from '../util.js';
+import { parseJSON, norm, clean } from '../util.js';
+import { readSheet } from '../parsers/registrar.js';
 
 const r = Router();
 
@@ -16,14 +18,18 @@ r.get('/', (req, res) => {
     FROM users u LEFT JOIN users p ON p.id = u.parent_id
     WHERE u.name LIKE ? OR u.email LIKE ? OR COALESCE(u.code,'') LIKE ?
     ORDER BY u.level, u.name`).all(q, q, q);
-  res.json(rows.map((u) => ({ ...publicUser(u), parent_name: u.parent_name, clients: u.clients, level_name: LEVEL_NAMES[u.level] })));
+  // Only admins see the whole team (with bank details); others see themselves and, for a mentor,
+  // their direct reports.
+  const allowed = req.user.role === 'admin' ? null : new Set([req.user.id, ...teamOf(req.user).map((u) => u.id)]);
+  res.json(rows.filter((u) => !allowed || allowed.has(u.id)).map((u) => ({ ...publicUser(u), parent_name: u.parent_name, clients: u.clients, level_name: LEVEL_NAMES[u.level] })));
 });
 
 r.get('/levels', (_req, res) => res.json(LEVEL_NAMES));
 
 r.get('/:id', (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
-  if (!u) throw new Error('User not found');
+  const mine = req.user.role === 'admin' || u?.id === req.user.id || teamOf(req.user).some((x) => x.id === u?.id);
+  if (!u || !mine) throw new Error('User not found');
   res.json(publicUser(u));
 });
 
@@ -37,7 +43,7 @@ function fieldsFrom(body) {
     pan: body.pan?.trim()?.toUpperCase() || null,
     parent_id: body.parent_id ? Number(body.parent_id) : null,
     sharing_pct: Number(body.sharing_pct) || 0,
-    role: ['admin', 'ops', 'partner'].includes(body.role) ? body.role : 'ops',
+    role: ['admin', 'ops', 'mentor', 'partner'].includes(body.role) ? body.role : 'ops',
     level: Math.min(7, Math.max(1, Number(body.level) || 1)),
     extra_levels: JSON.stringify(levels),
     bank: JSON.stringify(body.bank || {}),
@@ -114,6 +120,111 @@ r.delete('/:id', requireAdmin, (req, res) => {
   recalculate();
   audit(req.user, 'USER_DELETE', `Deleted user ${u.name} (${u.email})`);
   res.json({ ok: true });
+});
+
+// ---------- Bulk import of RMs and mentors (creates their accounts) ----------
+// Same columns as the team export, so an export can be edited and imported back for new people.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const TEAM_COLS = {
+  name: ['fullname', 'name', 'rmname', 'mentorname'], email: ['accessemail', 'email', 'emailid', 'loginemail'],
+  code: ['employeearncode', 'employeecode', 'arncode', 'code', 'arn', 'empcode'], level: ['level', 'primarylevel', 'systemlevel'],
+  parent: ['reportsto', 'reportingto', 'manager', 'parent'], role: ['role', 'accessrole'], password: ['password', 'accountpassword'],
+  sharing: ['sharing', 'sharingrate', 'sharingpct'], gst: ['gstin', 'gst', 'gstnumber'], pan: ['pan', 'pannumber'],
+  extra: ['additionallevels', 'extralevels'], holder: ['accountholder', 'accountholdername'], bankName: ['bankname', 'bank'],
+  branch: ['branch', 'branchname'], account: ['accountnumber', 'accountno'], ifsc: ['ifsc', 'ifsccode'],
+  street: ['street', 'address', 'streetbuilding'], city: ['city'], state: ['state'], pincode: ['pincode', 'pin'],
+};
+const DEFAULT_PASSWORD = 'Welcome@123';
+const ROLES = { ops: 'ops', rm: 'ops', opsrm: 'ops', mentor: 'mentor', partner: 'partner', admin: 'admin' };
+
+function readTeamFile(buffer, fileName) {
+  const rows = readSheet(buffer, fileName);
+  for (let i = 0; i < Math.min(rows.length, 15); i++) {
+    const keys = rows[i].map((h) => norm(h));
+    const cols = {};
+    for (const [f, names] of Object.entries(TEAM_COLS)) {
+      const at = keys.findIndex((k) => names.includes(k));
+      if (at >= 0) cols[f] = at;
+    }
+    if ('name' in cols && 'email' in cols) {
+      return rows.slice(i + 1).filter((r) => r.some((c) => String(c).trim() !== ''))
+        .map((r) => Object.fromEntries(Object.entries(cols).map(([f, at]) => [f, clean(r[at])])));
+    }
+  }
+  throw new Error('No header row with Full Name and Access Email found. Download the template from the Hierarchy tab.');
+}
+
+const levelOf = (v) => { const n = Number(String(v).replace(/[^0-9]/g, '')); return n >= 1 && n <= 7 ? n : null; };
+
+function previewTeam(rows) {
+  const existing = db.prepare('SELECT id, name, email, code, level FROM users').all();
+  const find = (v) => {
+    const k = String(v || '').trim().toLowerCase();
+    return k ? existing.find((u) => u.email.toLowerCase() === k || (u.code || '').toLowerCase() === k || u.name.toLowerCase() === k) : null;
+  };
+  const seen = new Map();
+  const out = rows.map((x, i) => {
+    const errors = []; const notes = [];
+    const email = x.email.toLowerCase();
+    const level = levelOf(x.level || 1);
+    const role = x.role ? ROLES[norm(x.role)] : 'ops';
+    if (!x.name) errors.push('Full Name is missing');
+    if (!/^\S+@\S+\.\S+$/.test(email)) errors.push('Access Email is missing or not valid');
+    else if (existing.some((u) => u.email.toLowerCase() === email)) errors.push('An account with this email already exists');
+    else if (seen.has(email)) errors.push(`Same email as row ${seen.get(email) + 2}`);
+    if (!level) errors.push(`Level "${x.level}" isn't 1 to 7`);
+    if (!role) errors.push(`Role "${x.role}" isn't Ops, RM, Mentor, Partner or Admin`);
+    if (x.password && x.password.length < 6) errors.push('Password must be at least 6 characters');
+    if (!x.password) notes.push(`Password will be ${DEFAULT_PASSWORD}`);
+    seen.set(email, i);
+    return { row: i + 2, name: x.name, email, code: x.code || null, level, role, parentRef: x.parent || '', password: x.password || '',
+      sharing: Number(x.sharing) || 0, gst: x.gst || null, pan: x.pan ? x.pan.toUpperCase() : null,
+      extra: String(x.extra || '').split(/[,\s]+/).map(levelOf).filter((l) => l && l !== level),
+      bank: { holder: x.holder || '', bankName: x.bankName || '', branch: x.branch || '', account: x.account || '', ifsc: (x.ifsc || '').toUpperCase() },
+      address: { street: x.street || '', city: x.city || '', state: x.state || '', pincode: x.pincode || '', country: 'India' },
+      errors, notes };
+  });
+  // Reports To: an existing person, or someone earlier/later in the same file.
+  for (const p of out) {
+    if (!p.parentRef || /^(none|\(none\)|-|nobody|admin)$/i.test(p.parentRef)) { p.parentRef = ''; continue; }
+    const k = p.parentRef.toLowerCase();
+    const inFile = out.find((o) => o !== p && (o.email === k || (o.code || '').toLowerCase() === k || o.name.toLowerCase() === k));
+    const ex = find(p.parentRef);
+    const boss = inFile ? { name: inFile.name, level: inFile.level } : ex;
+    if (!boss) p.errors.push(`Reports To "${p.parentRef}" not found in the team or this file`);
+    else {
+      p.parentName = boss.name;
+      if (p.level && boss.level && boss.level <= p.level) p.errors.push(`Reports To ${boss.name} is L${boss.level}; a manager must be a higher level than L${p.level}`);
+      else if (p.level <= 3 && boss.level < 4) p.notes.push(`L1-L3 normally report directly to an L4 or above (${boss.name} is L${boss.level})`);
+    }
+  }
+  return out;
+}
+
+r.post('/import/preview', requireAdmin, upload.single('file'), (req, res) => {
+  if (!req.file) throw new Error('Choose a file');
+  const rows = previewTeam(readTeamFile(req.file.buffer, req.file.originalname));
+  res.json({ rows, ok: rows.filter((x) => !x.errors.length).length, errors: rows.filter((x) => x.errors.length).length });
+});
+
+r.post('/import/apply', requireAdmin, upload.single('file'), (req, res) => {
+  if (!req.file) throw new Error('Choose a file');
+  const rows = previewTeam(readTeamFile(req.file.buffer, req.file.originalname)).filter((x) => !x.errors.length);
+  const created = [];
+  tx(() => {
+    const ins = db.prepare(`INSERT INTO users(name, email, code, gst, pan, parent_id, sharing_pct, role, level, extra_levels, bank, address, password_hash)
+      VALUES(?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const x of rows) {
+      const id = ins.run(x.name, x.email, x.code, x.gst, x.pan, x.sharing, x.role, x.level, JSON.stringify(x.extra), JSON.stringify(x.bank),
+        JSON.stringify(x.address), bcrypt.hashSync(x.password || DEFAULT_PASSWORD, 10)).lastInsertRowid;
+      created.push({ ...x, id: Number(id) });
+    }
+    // Link managers once everyone in the file exists.
+    const byKey = (k) => db.prepare('SELECT id FROM users WHERE lower(email) = ? OR lower(code) = ? OR lower(name) = ? ORDER BY id LIMIT 1').get(k, k, k)?.id;
+    for (const x of created) if (x.parentRef) db.prepare('UPDATE users SET parent_id = ? WHERE id = ?').run(byKey(x.parentRef.toLowerCase()) ?? null, x.id);
+  });
+  audit(req.user, 'USER_IMPORT', `Imported ${created.length} team account(s)`);
+  res.json({ created: created.length });
 });
 
 export default r;

@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { db, getSetting, setSetting, audit, notify, tx, LEVEL_NAMES } from '../db.js';
-import { requireAdmin, scopeUser } from '../auth.js';
+import { requireAdmin, scopeUser, teamOf } from '../auth.js';
 import { recalculate, chainFor, leadByError } from '../services/payout.js';
 import { invoiceTax } from '../services/tax.js';
 import { linkFolio } from '../services/mapping.js';
@@ -23,7 +23,7 @@ function periodFilter(q) {
 }
 
 // Whose numbers: admins may look at anyone via ?userId, others only at themselves.
-const targetUser = (req) => (req.user.role === 'admin' && req.query.userId ? Number(req.query.userId) : req.user.id);
+const targetUser = (req) => (req.user.role === 'admin' ? (req.query.userId ? Number(req.query.userId) : req.user.id) : scopeUser(req));
 
 r.get('/summary', (req, res) => {
   const pf = periodFilter(req.query);
@@ -146,13 +146,15 @@ r.get('/logs', (req, res) => {
 r.get('/team', (req, res) => {
   const pf = periodFilter(req.query);
   const uid = scopeUser(req);
+  // A mentor looking at their own view sees themselves plus each direct report.
+  const ids = uid && uid === req.user.id && req.user.role === 'mentor' ? [uid, ...teamOf(req.user).map((u) => u.id)] : uid ? [uid] : null;
   const rows = db.prepare(`
     SELECT u.id, u.name, u.code, u.level, u.role,
       COALESCE((SELECT SUM(b.amount) FROM brokerage b ${LIVE} WHERE ${pf.sql}
         AND b.id IN (SELECT brokerage_id FROM payout_lines WHERE user_id = u.id)), 0) gross,
       COALESCE((SELECT SUM(l.amount) FROM payout_lines l JOIN brokerage b ON b.id = l.brokerage_id ${LIVE}
         WHERE ${pf.sql} AND l.user_id = u.id), 0) earnings
-    FROM users u WHERE u.active = 1 ${uid ? 'AND u.id = ?' : ''} ORDER BY u.level DESC, earnings DESC`).all(...pf.args, ...pf.args, ...(uid ? [uid] : []))
+    FROM users u WHERE u.active = 1 ${ids ? `AND u.id IN (${ids.map(() => '?').join(',')})` : ''} ORDER BY u.level DESC, earnings DESC`).all(...pf.args, ...pf.args, ...(ids || []))
     .map((u) => ({ ...u, level_name: u.role === 'admin' ? 'ADMIN' : LEVEL_NAMES[u.level], pctOfGross: u.gross ? (u.earnings / u.gross) * 100 : 0, status: 'CALCULATED' }));
   res.json({ rows, label: pf.label });
 });
