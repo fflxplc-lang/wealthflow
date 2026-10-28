@@ -60,10 +60,43 @@ r.get('/', (req, res) => {
   res.json({ rows: list.slice((page - 1) * size, page * size), total: list.length, page, size, counts });
 });
 
-// Folios that carry brokerage but belong to no client.
-r.get('/orphan-folios', (_req, res) => {
-  res.json(db.prepare(`SELECT b.folio, MAX(b.investor) investor, MAX(b.pan) pan, COUNT(*) txns, SUM(b.amount) gross
-    FROM brokerage b ${LIVE} WHERE b.client_id IS NULL GROUP BY b.folio ORDER BY gross DESC`).all());
+// Folios that carry brokerage but belong to no client, with what the statements say about them and
+// the client they most likely belong to (same folio already on a client, else same PAN).
+r.get('/orphan-folios', requireAdmin, (_req, res) => {
+  const latest = latestPeriod();
+  const rows = db.prepare(`SELECT b.folio, MAX(b.investor) investor, MAX(b.pan) pan, MAX(b.amc) amc,
+      COUNT(DISTINCT b.scheme) schemes, MAX(b.scheme) scheme, COUNT(*) txns, COALESCE(SUM(b.amount), 0) gross,
+      COALESCE(SUM(CASE WHEN b.period = ? THEN b.aum END), 0) aum, MIN(b.period) firstPeriod, MAX(b.period) lastPeriod
+    FROM brokerage b ${LIVE} WHERE b.client_id IS NULL GROUP BY b.folio ORDER BY gross DESC`).all(latest);
+  const byFolio = db.prepare('SELECT c.id, c.name FROM folios f JOIN clients c ON c.id = f.client_id WHERE f.folio = ?');
+  const byPan = db.prepare('SELECT id, name FROM clients WHERE upper(pan) = upper(?) ORDER BY id LIMIT 1');
+  const byName = db.prepare('SELECT id, name FROM clients WHERE upper(trim(name)) = upper(trim(?))');
+  for (const x of rows) {
+    const f = x.folio && byFolio.get(x.folio);
+    const p = !f && x.pan && byPan.get(x.pan);
+    const n = !f && !p && x.investor ? byName.all(x.investor) : [];
+    const m = f || p || (n.length === 1 ? n[0] : null);
+    x.match = m ? { id: m.id, name: m.name, by: f ? 'folio' : p ? 'PAN' : 'name' } : null;
+  }
+  res.json(rows);
+});
+
+// Attach folios with no client to a client; their brokerage is then split on that client's mapping.
+r.post('/orphan-folios/link', requireAdmin, (req, res) => {
+  const items = Array.isArray(req.body.items) ? req.body.items : [{ folio: req.body.folio, clientId: req.body.clientId }];
+  const ids = new Set();
+  tx(() => {
+    for (const { folio, clientId } of items) {
+      const c = db.prepare('SELECT id FROM clients WHERE id = ?').get(Number(clientId));
+      if (!folio || !c) continue;
+      if (!db.prepare('SELECT 1 FROM folios WHERE folio = ?').get(folio)) linkFolio(folio, c.id);
+      db.prepare('UPDATE brokerage SET client_id = ? WHERE folio = ? AND client_id IS NULL').run(c.id, folio);
+      ids.add(c.id);
+    }
+  });
+  if (ids.size) recalculate({ clientIds: [...ids] });
+  audit(req.user, 'FOLIO_LINK', `Linked ${items.length} folio(s) with no client to ${ids.size} client(s)`);
+  res.json({ linked: items.length, clients: ids.size });
 });
 
 function saveFolios(clientId, folios) {

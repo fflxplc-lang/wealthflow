@@ -317,6 +317,56 @@ function MapModal({ client, users, onClose, onSaved }) {
   );
 }
 
+// Folios with brokerage but no client: what the statements say, the likely client, and a way to fix it.
+function OrphanFolios({ q, onFixed }) {
+  const { data, reload } = useLoad(() => api.get('/clients/orphan-folios'), []);
+  const [page, setPage] = useState(1);
+  const [create, setCreate] = useState(null);
+  const [run, busy] = useAction();
+  useEffect(() => setPage(1), [q]);
+  if (!data) return <Spinner />;
+  const k = q.trim().toLowerCase();
+  const list = k ? data.filter((f) => [f.folio, f.investor, f.pan, f.amc, f.scheme].some((v) => String(v || '').toLowerCase().includes(k))) : data;
+  const matched = list.filter((f) => f.match);
+  const done = () => { reload(); onFixed(); };
+  const link = (items) => run(() => api.post('/clients/orphan-folios/link', { items }).then(done), `${items.length} folio${items.length === 1 ? '' : 's'} linked`);
+  const doExport = () => exportExcel(list.map((f) => ({ Folio: f.folio, 'Investor on statement': f.investor || '', PAN: f.pan || '', AMC: f.amc || '', Scheme: f.scheme || '',
+    Schemes: f.schemes, Txns: f.txns, 'Gross Brokerage': f.gross, AUM: f.aum, 'First Month': f.firstPeriod, 'Last Month': f.lastPeriod, 'Likely Client': f.match?.name || '', 'Matched By': f.match?.by || '' })), 'folios-with-no-client.xlsx');
+  return (
+    <>
+      <div className="row gap wrap" style={{ padding: '0 20px 12px', justifyContent: 'space-between' }}>
+        <div className="small muted">These folios have brokerage but aren't linked to any client, so their brokerage goes to the company. Link each one to its client, or create the client.</div>
+        <div className="row gap-sm">
+          <button className="btn btn-soft btn-caps btn-sm" onClick={doExport} disabled={!list.length}><Download size={13} />Export list</button>
+          {matched.length > 0 && <button className="btn btn-primary btn-caps btn-sm" disabled={busy} onClick={() => link(matched.map((f) => ({ folio: f.folio, clientId: f.match.id })))}><Check size={13} />Link all {matched.length} matched</button>}
+        </div>
+      </div>
+      <div className="table-wrap"><table className="t">
+        <thead><tr><th>Folio</th><th>Investor on statement</th><th>AMC / Scheme</th><th className="r">Txns</th><th className="r">Gross</th><th className="r">AUM</th><th>Months</th><th>Likely client</th><th className="r">Action</th></tr></thead>
+        <tbody>{!list.length && <tr><td colSpan={9}><Empty title={k ? 'No folio matches the search' : 'Every folio with brokerage belongs to a client'} /></td></tr>}
+          {list.slice((page - 1) * 50, page * 50).map((f) => (
+            <tr key={f.folio ?? 'none'}>
+              <td className="mono semi">{f.folio || <i className="faint">blank</i>}</td>
+              <td><div className="cell-main">{f.investor || <i className="faint">unknown</i>}</div><div className="cell-sub blue mono">{f.pan || 'NO PAN'}</div></td>
+              <td><div className="small semi">{f.amc || '—'}</div><div className="cell-sub" style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.scheme || ''}{f.schemes > 1 ? ` +${f.schemes - 1} more` : ''}</div></td>
+              <td className="r">{f.txns}</td>
+              <td className="r t-amber bold" style={{ whiteSpace: 'nowrap' }}>₹{Number(f.gross).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+              <td className="r" style={{ whiteSpace: 'nowrap' }}>{inrShort(f.aum)}</td>
+              <td className="small" style={{ whiteSpace: 'nowrap' }}>{f.firstPeriod === f.lastPeriod ? f.lastPeriod : <>{f.firstPeriod}<div className="cell-sub">to {f.lastPeriod}</div></>}</td>
+              <td>{f.match ? <><div className="semi">{f.match.name}</div><div className="cell-sub upper">same {f.match.by}</div></> : <span className="faint small">none found</span>}</td>
+              <td className="r" style={{ whiteSpace: 'nowrap' }}>
+                {f.match && <button className="btn btn-xs btn-caps" style={{ color: 'var(--blue)', borderColor: '#c7d7fe' }} disabled={busy || !f.folio} onClick={() => link([{ folio: f.folio, clientId: f.match.id }])}><Check size={12} />Link</button>}
+                {f.folio && <button className="btn btn-xs btn-caps" onClick={() => setCreate({ name: f.investor || '', pan: f.pan || '', folios: [f.folio] })}><Plus size={12} />Create</button>}
+              </td>
+            </tr>))}
+        </tbody>
+      </table></div>
+      <Pager page={page} total={list.length} onPage={setPage} />
+      {create && <ClientModal initial={create} onClose={() => setCreate(null)} onSaved={done} />}
+    </>
+  );
+}
+
 function ClientList({ initialQ, admin }) {
   const [q, setQ] = useState(initialQ || '');
   const [filter, setFilter] = useState('all');
@@ -326,7 +376,7 @@ function ClientList({ initialQ, admin }) {
   const [del, setDel] = useState(null);
   const [checked, setChecked] = useState(new Set());
   const [run] = useAction();
-  const { data, reload } = useLoad(() => (filter === 'orphan' ? api.get('/clients/orphan-folios') : api.get(`/clients${qs({ q, filter, page })}`)), [q, filter, page]);
+  const { data, reload } = useLoad(() => (filter === 'orphan' ? Promise.resolve(null) : api.get(`/clients${qs({ q, filter, page })}`)), [q, filter, page]);
   const users = useLoad(() => api.get('/users'), []);
   const counts = useLoad(() => api.get('/clients?size=1'), [data]);
   const c = counts.data?.counts || {};
@@ -334,26 +384,20 @@ function ClientList({ initialQ, admin }) {
     const r = await api.get(`/clients${qs({ q, filter, all: 1 })}`);
     exportExcel(r.rows.map((x) => ({ Name: x.name, PAN: x.pan, Email: x.email, Mobile: x.mobile, Folios: x.folios.join(', '), AUM: x.aum, 'Assigned Manager': x.owner?.name || '', Level: x.owner?.level || '' })), 'clients.xlsx');
   };
-  const pills = [['all', 'All Clients', c.all], ['noRM', 'No RM', c.noRM], ['noBM', 'No BM', c.noBM], ['noFolios', 'No Folios', c.noFolios], ['orphan', 'Folios with no client', c.orphanFolios]];
+  const pills = [['all', 'All Clients', c.all], ['noRM', 'No RM', c.noRM], ['noBM', 'No BM', c.noBM], ['noFolios', 'No Folios', c.noFolios], ...(admin ? [['orphan', 'Folios with no client', c.orphanFolios]] : [])];
   return (
     <Card>
       <div className="card-head" style={{ borderBottom: 0 }}>
         <div className="input-icon" style={{ width: 340 }}><Search size={15} /><input className="input" placeholder="Search portfolios..." value={q} onChange={(e) => { setQ(e.target.value); setPage(1); }} /></div>
         <div className="row gap">
-          <button className="btn btn-green btn-caps" onClick={doExport}><Download size={14} />Export</button>
+          {filter !== 'orphan' && <button className="btn btn-green btn-caps" onClick={doExport}><Download size={14} />Export</button>}
           {admin && <button className="btn btn-primary btn-caps" onClick={() => setEdit({})}><Plus size={14} />Add Client</button>}
         </div>
       </div>
       <div className="pills">
         {pills.map(([k, label, n]) => <button key={k} className={`pill ${filter === k ? 'on' : ''} ${k === 'orphan' && filter !== k ? 'warn' : ''}`} onClick={() => { setFilter(k); setPage(1); }}>{label} <span className="n">{n ?? '?'}</span></button>)}
       </div>
-      {!data ? <Spinner /> : filter === 'orphan' ? (
-        <div className="table-wrap"><table className="t">
-          <thead><tr><th>Folio</th><th>Investor on statement</th><th>PAN</th><th className="r">Txns</th><th className="r">Gross</th></tr></thead>
-          <tbody>{!data.length && <tr><td colSpan={5}><Empty title="Every folio with brokerage belongs to a client" /></td></tr>}
-            {data.map((f) => <tr key={f.folio}><td className="mono">{f.folio}</td><td>{f.investor || <i className="faint">unknown</i>}</td><td className="mono small">{f.pan || '—'}</td><td className="r">{f.txns}</td><td className="r t-amber bold">₹{f.gross.toFixed(2)}</td></tr>)}</tbody>
-        </table></div>
-      ) : (
+      {filter === 'orphan' ? <OrphanFolios q={q} onFixed={() => { reload(); counts.reload(); }} /> : !data?.rows ? <Spinner /> : (
         <>
           <div className="table-wrap">
             <table className="t">
