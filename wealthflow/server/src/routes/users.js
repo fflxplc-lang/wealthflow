@@ -53,11 +53,19 @@ function fieldsFrom(body) {
   };
 }
 
+// One email may hold several accounts of the same person (BM + RM ID), never two different people.
+function emailCheck(f, exceptId = 0) {
+  const same = db.prepare('SELECT name, pan FROM users WHERE lower(email) = lower(?) AND id <> ?').all(f.email, exceptId);
+  const samePerson = (u) => (u.pan && f.pan && u.pan.toUpperCase() === String(f.pan).toUpperCase()) || u.name.trim().toLowerCase() === String(f.name || '').trim().toLowerCase();
+  const other = same.find((u) => !samePerson(u));
+  if (other) throw new Error(`This email already belongs to ${other.name}. One email can only be shared by accounts of the same person.`);
+}
+
 r.post('/', requireAdmin, (req, res) => {
   const f = fieldsFrom(req.body);
   if (!f.name || !f.email) throw new Error('Full name and access email are required');
   if (!req.body.password || req.body.password.length < 6) throw new Error('Password must be at least 6 characters');
-  if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(f.email)) throw new Error('A user with this email already exists');
+  emailCheck(f);
   const cols = Object.keys(f);
   const id = db.prepare(`INSERT INTO users(${cols.join(',')}, password_hash) VALUES(${cols.map(() => '?').join(',')}, ?)`)
     .run(...Object.values(f), bcrypt.hashSync(req.body.password, 10)).lastInsertRowid;
@@ -78,6 +86,7 @@ r.put('/:id', (req, res) => {
     f = { name: f.name, bank: f.bank, address: f.address, gst: f.gst, pan: f.pan, arn: f.arn, arn_valid: f.arn_valid, euin: f.euin, euin_valid: f.euin_valid };
   }
   if (f.parent_id === id) throw new Error('A user cannot report to themselves');
+  if (f.email && f.email !== cur.email.toLowerCase()) emailCheck({ ...publicUser(cur), ...f }, id);
   if (req.body.signature !== undefined) f.signature = req.body.signature;
   db.prepare(`UPDATE users SET ${Object.keys(f).map((k) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...Object.values(f), id);
   if (req.body.password) db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(req.body.password, 10), id);
@@ -124,9 +133,9 @@ r.delete('/:id', requireAdmin, (req, res) => {
 
 // ---------- RM IDs for BMs ----------
 // A BM (L4+) who also works clients as an RM gets a second, RM-level account with the same details.
-// It reports to the BM's own account. Login: the BM's email with "+rm" (name+rm@domain reaches the same
-// inbox) or the BM's code with "-RM", and the same password as the BM.
-const rmEmailFor = (email) => email.replace(/^([^@+]+)(\+[^@]*)?@/, '$1+rm@');
+// It reports to the BM's own account and shares their email and password; signing in with the email asks
+// which account, the code with "-RM" opens the RM ID directly.
+const rmIdOf = (bm) => db.prepare('SELECT id FROM users WHERE parent_id = ? AND level <= 3 AND lower(email) = lower(?)').get(bm.id, bm.email);
 r.post('/rm-ids', requireAdmin, (req, res) => {
   const level = Number(req.body.level) || 1;
   if (level < 1 || level > 3) throw new Error('An RM ID must be level 1, 2 or 3');
@@ -136,8 +145,8 @@ r.post('/rm-ids', requireAdmin, (req, res) => {
     for (const id of ids) {
       const bm = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
       if (!bm || bm.level < 4 || bm.role === 'admin') { skipped.push({ id, name: bm?.name, reason: 'not an L4+ BM' }); continue; }
-      const email = rmEmailFor(bm.email);
-      if (db.prepare('SELECT 1 FROM users WHERE lower(email) = lower(?)').get(email)) { skipped.push({ id, name: bm.name, reason: 'already has an RM ID' }); continue; }
+      const email = bm.email;
+      if (rmIdOf(bm)) { skipped.push({ id, name: bm.name, reason: 'already has an RM ID' }); continue; }
       const code = bm.code ? `${bm.code}-RM` : null;
       const nid = db.prepare(`INSERT INTO users(name, email, code, gst, pan, parent_id, sharing_pct, role, level, extra_levels, bank, address,
           arn, arn_valid, euin, euin_valid, password_hash) VALUES(?, ?, ?, ?, ?, ?, 0, 'ops', ?, '[]', ?, ?, ?, ?, ?, ?, ?)`)
@@ -197,7 +206,8 @@ function previewTeam(rows) {
     const role = x.role ? ROLES[norm(x.role)] : 'ops';
     if (!x.name) errors.push('Full Name is missing');
     if (!/^\S+@\S+\.\S+$/.test(email)) errors.push('Access Email is missing or not valid');
-    else if (existing.some((u) => u.email.toLowerCase() === email)) errors.push('An account with this email already exists');
+    else if (existing.some((u) => u.email.toLowerCase() === email && u.name.toLowerCase() !== String(x.name).toLowerCase())) errors.push('This email already belongs to another person');
+    else if (existing.some((u) => u.email.toLowerCase() === email)) notes.push('Same email as an existing account of this person; they will choose the account at sign-in');
     else if (seen.has(email)) errors.push(`Same email as row ${seen.get(email) + 2}`);
     if (!level) errors.push(`Level "${x.level}" isn't 1 to 7`);
     if (!role) errors.push(`Role "${x.role}" isn't Ops, RM, Mentor, Partner or Admin`);

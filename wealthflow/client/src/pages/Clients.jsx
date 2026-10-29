@@ -126,19 +126,17 @@ const TEMPLATE = [
 ];
 
 // Second, RM-level account for BMs (L4+) who also handle clients themselves. Same details and password,
-// reports to the BM's own account; the server makes the login email name+rm@domain and the code CODE-RM.
-const rmEmailFor = (email) => email.replace(/^([^@+]+)(\+[^@]*)?@/, '$1+rm@');
+// reports to the BM's own account and shares their email; the RM ID's code is CODE-RM.
 function RmIds({ users, onClose, onDone }) {
-  const emails = new Set(users.map((u) => u.email.toLowerCase()));
   const bms = users.filter((u) => u.level >= 4 && u.role !== 'admin').sort((a, b) => b.level - a.level || a.name.localeCompare(b.name));
-  const has = (u) => emails.has(rmEmailFor(u.email).toLowerCase());
+  const has = (u) => users.some((x) => Number(x.parent_id) === u.id && x.level <= 3 && x.email.toLowerCase() === u.email.toLowerCase());
   const [pick, setPick] = useState(() => new Set(bms.filter((u) => !has(u)).map((u) => u.id)));
   const [level, setLevel] = useState(1);
   const [run, busy] = useAction();
   const toggle = (id) => setPick((p0) => { const p = new Set(p0); p.has(id) ? p.delete(id) : p.add(id); return p; });
   const create = () => run(async () => {
     const r = await api.post('/users/rm-ids', { ids: [...pick], level });
-    exportExcel(r.created.map((m) => ({ Name: m.name, 'RM Login Email': m.email, 'RM Login Code': m.code || '', Password: 'Same as their BM login' })), 'rm-ids-created.xlsx');
+    exportExcel(r.created.map((m) => ({ Name: m.name, 'Login Email (same as BM)': m.email, 'RM Login Code': m.code || '', Password: 'Same as their BM login' })), 'rm-ids-created.xlsx');
     onDone(); onClose();
   }, 'RM IDs created');
   return (
@@ -147,8 +145,8 @@ function RmIds({ users, onClose, onDone }) {
       <button className="btn btn-primary btn-caps btn-lg" disabled={busy || !pick.size} onClick={create}>Create {pick.size} RM ID{pick.size === 1 ? '' : 's'}</button>
     </>}>
       <div className="small muted">Each ticked BM gets a second account at the RM level below, with the same name, PAN, GSTIN, ARN/EUIN, bank, address and password.
-        It reports to the BM's own account. They sign in to it with the email shown (mail to <span className="mono">name+rm@…</span> arrives in the same inbox) or their code with <span className="mono">-RM</span>.
-        A list of the new logins downloads when you create them.</div>
+        It reports to the BM's own account and uses <b>the same email</b>. Signing in with that email asks which account to open (BM or RM), and inside the app they can switch between the two from the top bar.
+        Their code with <span className="mono">-RM</span> opens the RM account directly. A list of the new logins downloads when you create them.</div>
       <div className="row gap" style={{ alignItems: 'center' }}>
         <span className="small semi">RM level</span>
         <select className="select" style={{ width: 160 }} value={level} onChange={(e) => setLevel(Number(e.target.value))}>{[1, 2, 3].map((l) => <option key={l} value={l}>Level {l} · {LEVELS[l]}</option>)}</select>
@@ -163,7 +161,7 @@ function RmIds({ users, onClose, onDone }) {
                 <td><input type="checkbox" disabled={has(u)} checked={pick.has(u.id)} onChange={() => toggle(u.id)} /></td>
                 <td><div className="semi">{u.name}</div><div className="cell-sub">{u.email}</div></td>
                 <td>L{u.level}</td>
-                <td className="small">{has(u) ? <span className="faint">Already has an RM ID</span> : <><span className="mono">{rmEmailFor(u.email)}</span>{u.code && <div className="cell-sub mono">{u.code}-RM</div>}</>}</td>
+                <td className="small">{has(u) ? <span className="faint">Already has an RM ID</span> : <><span className="mono">{u.email}</span>{u.code && <div className="cell-sub mono">or {u.code}-RM</div>}</>}</td>
               </tr>))}
           </tbody>
         </table>

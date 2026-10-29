@@ -3,7 +3,7 @@ import { Mail, Lock, Eye, EyeOff, ArrowRight } from 'lucide-react';
 import Logo from '../components/Logo.jsx';
 import { api, setToken } from '../api.js';
 import { useAuth } from '../auth.jsx';
-import { useToast } from '../ui.jsx';
+import { useToast, LEVELS } from '../ui.jsx';
 
 export default function Login() {
   const { setUser } = useAuth();
@@ -13,17 +13,20 @@ export default function Login() {
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [choose, setChoose] = useState(null);
 
-  const submit = async (e) => {
-    e.preventDefault();
+  // An email with more than one account (a BM and their RM ID) asks which one to open.
+  const signIn = async (accountId) => {
     setBusy(true); setError('');
     try {
-      const r = await api.post('/auth/login', { login, password });
+      const r = await api.post('/auth/login', { login, password, accountId });
+      if (r.choose) { setChoose(r.choose); return; }
       setToken(r.token);
       setUser(r.user);
-    } catch (err) { setError(err.message); }
+    } catch (err) { setError(err.message); setChoose(null); }
     finally { setBusy(false); }
   };
+  const submit = (e) => { e.preventDefault(); signIn(); };
   const recover = async () => {
     if (!login) { setError('Enter your ID or email first, then press Recovery.'); return; }
     const r = await api.post('/auth/recover', { login });
@@ -53,7 +56,16 @@ export default function Login() {
           </div>
         </label>
         {error && <div className="banner red">{error}</div>}
-        <button className="login-btn" disabled={busy}>{busy ? 'Verifying…' : 'Secure Access'} <ArrowRight size={17} /></button>
+        {choose ? (
+          <div className="col gap-sm">
+            <div className="small semi">This email has {choose.length} accounts. Which one do you want to open?</div>
+            {choose.map((a) => (
+              <button type="button" key={a.id} className="btn btn-soft" style={{ justifyContent: 'space-between' }} disabled={busy} onClick={() => signIn(a.id)}>
+                <span>{a.name} · L{a.level} {LEVELS[a.level]}</span><span className="tiny">{a.level <= 3 ? 'RM account' : a.role === 'admin' ? 'Admin' : 'BM account'}</span>
+              </button>))}
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setChoose(null)}>Back</button>
+          </div>
+        ) : <button className="login-btn" disabled={busy}>{busy ? 'Verifying…' : 'Secure Access'} <ArrowRight size={17} /></button>}
       </form>
     </div>
   );

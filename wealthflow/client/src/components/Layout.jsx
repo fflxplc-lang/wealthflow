@@ -7,7 +7,7 @@ import {
 import Logo from './Logo.jsx';
 import { api, setToken, getViewAs, setViewAs } from '../api.js';
 import { useAuth } from '../auth.jsx';
-import { timeAgo } from '../ui.jsx';
+import { timeAgo, LEVELS } from '../ui.jsx';
 
 const NAV = [
   { to: '/', label: 'Dashboard', icon: LayoutGrid },
@@ -126,6 +126,12 @@ export default function Layout({ children }) {
         <header className="topbar">
           <GlobalSearch />
           <div className="row gap">
+            {user.linked?.length > 0 && (
+              <select className="select sm" style={{ width: 'auto', maxWidth: 260 }} title="Accounts on your email" value={user.id}
+                onChange={async (e) => { const r = await api.post('/auth/switch', { accountId: Number(e.target.value) }); setViewAs(''); setToken(r.token); window.location.assign(import.meta.env.BASE_URL); }}>
+                {[user, ...user.linked].sort((a, b) => b.level - a.level).map((a) => <option key={a.id} value={a.id}>Account: L{a.level} {LEVELS[a.level]}{a.level <= 3 ? ' (RM)' : ' (BM)'}</option>)}
+              </select>
+            )}
             {user.role === 'mentor' && user.team?.length > 0 && (
               <select className="select sm" style={{ width: 'auto', maxWidth: 240 }} title="Whose data to show" value={getViewAs()}
                 onChange={(e) => { setViewAs(e.target.value); window.location.reload(); }}>

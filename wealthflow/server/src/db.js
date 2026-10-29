@@ -14,7 +14,7 @@ db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
-  email TEXT UNIQUE NOT NULL,
+  email TEXT NOT NULL,           -- not unique: a BM and their RM ID share one
   code TEXT,
   gst TEXT,
   pan TEXT,
@@ -161,6 +161,25 @@ if (db.prepare('PRAGMA table_info(brokerage)').all().some((c) => c.name === 'reg
 }
 
 // clients.lead_by (added later): the L4+ who brought the lead when a subordinate handles the client.
+// One email can now hold several accounts (a BM and their RM ID). SQLite can't drop a UNIQUE
+// constraint, so older databases rebuild the users table once. RM IDs made earlier as name+rm@ move
+// to their BM's email.
+{
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'").get()?.sql || '';
+  if (/email\s+TEXT\s+UNIQUE/i.test(sql)) {
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      db.exec(sql.replace(/CREATE TABLE (IF NOT EXISTS )?"?users"?/i, 'CREATE TABLE users_new').replace(/email(\s+)TEXT\s+UNIQUE/i, 'email$1TEXT'));
+      db.exec('INSERT INTO users_new SELECT * FROM users; DROP TABLE users; ALTER TABLE users_new RENAME TO users;');
+      db.exec(`UPDATE users SET email = (SELECT p.email FROM users p WHERE p.id = users.parent_id)
+        WHERE email LIKE '%+rm@%' AND level <= 3
+          AND (SELECT lower(p.email) FROM users p WHERE p.id = users.parent_id) = lower(replace(users.email, '+rm@', '@'))`);
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; } finally { db.exec('PRAGMA foreign_keys = ON'); }
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)');
+}
 if (!db.prepare('PRAGMA table_info(clients)').all().some((c) => c.name === 'lead_by')) db.exec('ALTER TABLE clients ADD COLUMN lead_by INTEGER');
 // brokerage/partner_rows.map_snapshot (added later): the client mapping a row was first split with,
 // so mapping changes only affect brokerage that arrives afterwards.
