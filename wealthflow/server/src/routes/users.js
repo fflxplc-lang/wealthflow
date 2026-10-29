@@ -122,6 +122,33 @@ r.delete('/:id', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- RM IDs for BMs ----------
+// A BM (L4+) who also works clients as an RM gets a second, RM-level account with the same details.
+// It reports to the BM's own account. Login: the BM's email with "+rm" (name+rm@domain reaches the same
+// inbox) or the BM's code with "-RM", and the same password as the BM.
+const rmEmailFor = (email) => email.replace(/^([^@+]+)(\+[^@]*)?@/, '$1+rm@');
+r.post('/rm-ids', requireAdmin, (req, res) => {
+  const level = Number(req.body.level) || 1;
+  if (level < 1 || level > 3) throw new Error('An RM ID must be level 1, 2 or 3');
+  const ids = (req.body.ids || []).map(Number);
+  const made = []; const skipped = [];
+  tx(() => {
+    for (const id of ids) {
+      const bm = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+      if (!bm || bm.level < 4 || bm.role === 'admin') { skipped.push({ id, name: bm?.name, reason: 'not an L4+ BM' }); continue; }
+      const email = rmEmailFor(bm.email);
+      if (db.prepare('SELECT 1 FROM users WHERE lower(email) = lower(?)').get(email)) { skipped.push({ id, name: bm.name, reason: 'already has an RM ID' }); continue; }
+      const code = bm.code ? `${bm.code}-RM` : null;
+      const nid = db.prepare(`INSERT INTO users(name, email, code, gst, pan, parent_id, sharing_pct, role, level, extra_levels, bank, address,
+          arn, arn_valid, euin, euin_valid, password_hash) VALUES(?, ?, ?, ?, ?, ?, 0, 'ops', ?, '[]', ?, ?, ?, ?, ?, ?, ?)`)
+        .run(bm.name, email, code, bm.gst, bm.pan, bm.id, level, bm.bank || '{}', bm.address || '{}', bm.arn, bm.arn_valid, bm.euin, bm.euin_valid, bm.password_hash).lastInsertRowid;
+      made.push({ id: Number(nid), name: bm.name, email, code });
+    }
+  });
+  if (made.length) audit(req.user, 'USER_RM_ID', `Created ${made.length} RM ID(s) at L${level} for BMs: ${made.map((m) => m.name).join(', ')}`);
+  res.json({ created: made, skipped });
+});
+
 // ---------- Bulk import of RMs and mentors (creates their accounts) ----------
 // Same columns as the team export, so an export can be edited and imported back for new people.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });

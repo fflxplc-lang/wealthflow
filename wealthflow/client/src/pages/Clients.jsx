@@ -125,6 +125,53 @@ const TEMPLATE = [
   { 'Full Name': 'Johnson M John', 'Access Email': 'johnson@example.com', 'Employee/ARN Code': 'WF-101', Level: 'L1', 'Reports To': 'anmol@example.com', Role: 'Ops / RM', Password: '', 'Sharing %': '', 'Additional Levels': '', GSTIN: '27ABCPJ1234F1Z6', PAN: '', 'Account Holder': '', 'Bank Name': '', Branch: '', 'Account Number': '', IFSC: '', Street: '', City: 'Pune', State: 'Maharashtra', Pincode: '411001' },
 ];
 
+// Second, RM-level account for BMs (L4+) who also handle clients themselves. Same details and password,
+// reports to the BM's own account; the server makes the login email name+rm@domain and the code CODE-RM.
+const rmEmailFor = (email) => email.replace(/^([^@+]+)(\+[^@]*)?@/, '$1+rm@');
+function RmIds({ users, onClose, onDone }) {
+  const emails = new Set(users.map((u) => u.email.toLowerCase()));
+  const bms = users.filter((u) => u.level >= 4 && u.role !== 'admin').sort((a, b) => b.level - a.level || a.name.localeCompare(b.name));
+  const has = (u) => emails.has(rmEmailFor(u.email).toLowerCase());
+  const [pick, setPick] = useState(() => new Set(bms.filter((u) => !has(u)).map((u) => u.id)));
+  const [level, setLevel] = useState(1);
+  const [run, busy] = useAction();
+  const toggle = (id) => setPick((p0) => { const p = new Set(p0); p.has(id) ? p.delete(id) : p.add(id); return p; });
+  const create = () => run(async () => {
+    const r = await api.post('/users/rm-ids', { ids: [...pick], level });
+    exportExcel(r.created.map((m) => ({ Name: m.name, 'RM Login Email': m.email, 'RM Login Code': m.code || '', Password: 'Same as their BM login' })), 'rm-ids-created.xlsx');
+    onDone(); onClose();
+  }, 'RM IDs created');
+  return (
+    <Modal wide title="Create RM IDs for BMs" onClose={onClose} footer={<>
+      <button className="btn btn-ghost btn-caps" onClick={onClose}>Cancel</button>
+      <button className="btn btn-primary btn-caps btn-lg" disabled={busy || !pick.size} onClick={create}>Create {pick.size} RM ID{pick.size === 1 ? '' : 's'}</button>
+    </>}>
+      <div className="small muted">Each ticked BM gets a second account at the RM level below, with the same name, PAN, GSTIN, ARN/EUIN, bank, address and password.
+        It reports to the BM's own account. They sign in to it with the email shown (mail to <span className="mono">name+rm@…</span> arrives in the same inbox) or their code with <span className="mono">-RM</span>.
+        A list of the new logins downloads when you create them.</div>
+      <div className="row gap" style={{ alignItems: 'center' }}>
+        <span className="small semi">RM level</span>
+        <select className="select" style={{ width: 160 }} value={level} onChange={(e) => setLevel(Number(e.target.value))}>{[1, 2, 3].map((l) => <option key={l} value={l}>Level {l} · {LEVELS[l]}</option>)}</select>
+      </div>
+      <div className="table-wrap scroll" style={{ maxHeight: 380 }}>
+        <table className="t compact">
+          <thead><tr><th style={{ width: 30 }}><input type="checkbox" checked={pick.size > 0 && bms.filter((u) => !has(u)).every((u) => pick.has(u.id))} onChange={(e) => setPick(new Set(e.target.checked ? bms.filter((u) => !has(u)).map((u) => u.id) : []))} /></th>
+            <th>BM</th><th>Level</th><th>New RM login</th></tr></thead>
+          <tbody>{!bms.length && <tr><td colSpan={4}><Empty title="No L4+ BMs in the team" /></td></tr>}
+            {bms.map((u) => (
+              <tr key={u.id}>
+                <td><input type="checkbox" disabled={has(u)} checked={pick.has(u.id)} onChange={() => toggle(u.id)} /></td>
+                <td><div className="semi">{u.name}</div><div className="cell-sub">{u.email}</div></td>
+                <td>L{u.level}</td>
+                <td className="small">{has(u) ? <span className="faint">Already has an RM ID</span> : <><span className="mono">{rmEmailFor(u.email)}</span>{u.code && <div className="cell-sub mono">{u.code}-RM</div>}</>}</td>
+              </tr>))}
+          </tbody>
+        </table>
+      </div>
+    </Modal>
+  );
+}
+
 function ImportTeam({ onClose, onDone }) {
   const [file, setFile] = useState(null);
   const [prev, setPrev] = useState(null);
@@ -175,6 +222,7 @@ function Hierarchy({ initialQ }) {
   const [edit, setEdit] = useState(null);
   const [del, setDel] = useState(null);
   const [importing, setImporting] = useState(false);
+  const [rmIds, setRmIds] = useState(false);
   const [run] = useAction();
   const toast = useToast();
   const doExport = () => {
@@ -196,6 +244,7 @@ function Hierarchy({ initialQ }) {
         <div className="row gap-sm wrap">
           <button className="btn btn-green btn-caps" onClick={doExport} disabled={!all.data}><Download size={14} />Export</button>
           <button className="btn btn-soft btn-caps" onClick={() => setImporting(true)}><Upload size={14} />Import</button>
+          <button className="btn btn-soft btn-caps" onClick={() => setRmIds(true)} disabled={!all.data}><Copy size={14} />Create RM IDs</button>
           <button className="btn btn-primary btn-caps" onClick={() => setEdit({})}><UserPlus size={14} />New User Account</button>
         </div>
       </div>
@@ -220,6 +269,7 @@ function Hierarchy({ initialQ }) {
         </div>
       )}
       {edit && <UserModal initial={edit} users={all.data || []} onClose={() => setEdit(null)} onSaved={() => { reload(); all.reload(); }} />}
+      {rmIds && <RmIds users={all.data || []} onClose={() => setRmIds(false)} onDone={() => { reload(); all.reload(); }} />}
       {importing && <ImportTeam onClose={() => setImporting(false)} onDone={() => { reload(); all.reload(); }} />}
       {del && <Confirm danger title="Delete user?" text={`${del.name} will be removed from every client hierarchy and their reports will move up to their manager. Payouts recalculate.`} confirmLabel="Delete"
         onClose={() => setDel(null)} onConfirm={() => run(() => api.del(`/users/${del.id}`).then(reload), 'User deleted')} />}
